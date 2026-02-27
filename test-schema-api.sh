@@ -102,10 +102,13 @@ SCHEMA_HASH="$(jq -r '.schema_hash' "${PULL_RESPONSE}")"
 GROUP_COUNT="$(jq -r '.group_count' "${PULL_RESPONSE}")"
 echo "Pull ok. schema_hash=${SCHEMA_HASH} group_count=${GROUP_COUNT}"
 
+groups_tmp="$(mktemp)"
+jq '.field_groups' "${PULL_RESPONSE}" > "${groups_tmp}"
 jq -n \
   --arg expected_hash "${SCHEMA_HASH}" \
-  --argjson field_groups "$(jq '.field_groups' "${PULL_RESPONSE}")" \
-  '{expected_hash: $expected_hash, dry_run: true, field_groups: $field_groups}' > "${PAYLOAD_FILE}"
+  --slurpfile field_groups "${groups_tmp}" \
+  '{expected_hash: $expected_hash, dry_run: true, field_groups: $field_groups[0]}' > "${PAYLOAD_FILE}"
+rm -f "${groups_tmp}"
 
 echo "Calling push dry-run endpoint..."
 dry_tmp="$(mktemp)"
