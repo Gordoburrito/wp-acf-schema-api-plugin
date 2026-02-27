@@ -66,6 +66,11 @@ if (!class_exists('RG_ACF_Schema_API')) {
                             'required' => false,
                             'default' => false,
                         ),
+                        'delete_missing_groups' => array(
+                            'type' => 'boolean',
+                            'required' => false,
+                            'default' => false,
+                        ),
                     ),
                 )
             );
@@ -165,6 +170,7 @@ if (!class_exists('RG_ACF_Schema_API')) {
 
             $incoming_map = $validated;
             $allow_field_key_changes = (bool) $request->get_param('allow_field_key_changes');
+            $delete_missing_groups = (bool) $request->get_param('delete_missing_groups');
 
             $duplicate_errors = self::validate_no_duplicate_sibling_field_names($incoming_map);
             if (!empty($duplicate_errors)) {
@@ -201,6 +207,7 @@ if (!class_exists('RG_ACF_Schema_API')) {
                 'incoming_hash' => $incoming_hash,
                 'dry_run' => $dry_run,
                 'allow_field_key_changes' => $allow_field_key_changes,
+                'delete_missing_groups' => $delete_missing_groups,
                 'plan' => $plan,
                 'source_counts' => $state['source_counts'],
                 'signature_verified' => true,
@@ -261,6 +268,34 @@ if (!class_exists('RG_ACF_Schema_API')) {
                 }
             }
 
+            $delete_report = array(
+                'requested' => $delete_missing_groups,
+                'attempted' => 0,
+                'deleted' => 0,
+                'missing_file' => 0,
+                'keys' => array(),
+                'missing_keys' => array(),
+            );
+            if ($delete_missing_groups) {
+                foreach ($plan['removed'] as $group_key) {
+                    $delete_report['attempted']++;
+                    $target_file = trailingslashit($json_dir) . sanitize_file_name($group_key . '.json');
+                    if (!file_exists($target_file)) {
+                        $delete_report['missing_file']++;
+                        $delete_report['missing_keys'][] = $group_key;
+                        continue;
+                    }
+
+                    if (!@unlink($target_file)) { // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+                        $write_errors[] = sprintf('Failed deleting target file for %s.', $group_key);
+                        continue;
+                    }
+
+                    $delete_report['deleted']++;
+                    $delete_report['keys'][] = $group_key;
+                }
+            }
+
             if (!empty($write_errors)) {
                 return new WP_Error(
                     'acf_schema_api_write_failed',
@@ -292,6 +327,7 @@ if (!class_exists('RG_ACF_Schema_API')) {
             $result['applied'] = true;
             $result['schema_hash_after'] = self::compute_schema_hash($refreshed['groups']);
             $result['import_report'] = $import_report;
+            $result['delete_report'] = $delete_report;
             $result['source_counts_after'] = $refreshed['source_counts'];
             if (!empty($refreshed['warnings'])) {
                 $result['warnings_after'] = $refreshed['warnings'];
@@ -1029,6 +1065,7 @@ if (!class_exists('RG_ACF_Schema_API')) {
             $create = array();
             $update = array();
             $unchanged = array();
+            $removed = array();
 
             foreach ($incoming_map as $group_key => $incoming_group) {
                 if (!isset($current_map[$group_key])) {
@@ -1045,13 +1082,21 @@ if (!class_exists('RG_ACF_Schema_API')) {
                 }
             }
 
+            foreach ($current_map as $group_key => $_current_group) {
+                if (!isset($incoming_map[$group_key])) {
+                    $removed[] = $group_key;
+                }
+            }
+
             return array(
                 'create' => $create,
                 'update' => $update,
                 'unchanged' => $unchanged,
+                'removed' => $removed,
                 'create_count' => count($create),
                 'update_count' => count($update),
                 'unchanged_count' => count($unchanged),
+                'removed_count' => count($removed),
             );
         }
 
