@@ -2,7 +2,7 @@
 /**
  * Plugin Name: ACF Schema API
  * Description: Secure REST endpoints to pull and push ACF schema JSON (field groups) with dry-run and hash lock support.
- * Version: 1.3.2
+ * Version: 1.3.3
  * Author: RG Ops
  */
 
@@ -319,6 +319,35 @@ if (!class_exists('RG_ACF_Schema_API')) {
                     'reason' => 'DB import disabled by default. Enable with acf_schema_api_import_to_db filter.',
                 );
             }
+
+            if ($delete_missing_groups) {
+                $db_delete_report = self::maybe_delete_groups_from_db($plan['removed']);
+            } else {
+                $db_delete_report = array(
+                    'requested' => false,
+                    'attempted' => 0,
+                    'deleted' => 0,
+                    'missing' => 0,
+                    'errors' => array(),
+                    'keys' => array(),
+                    'missing_keys' => array(),
+                    'mode' => 'skipped',
+                    'reason' => 'DB deletion runs only when delete_missing_groups=true.',
+                );
+            }
+
+            if (!empty($db_delete_report['errors'])) {
+                return new WP_Error(
+                    'acf_schema_api_db_delete_failed',
+                    'One or more removed field groups failed to delete from DB.',
+                    array(
+                        'status' => 500,
+                        'errors' => $db_delete_report['errors'],
+                        'report' => $db_delete_report,
+                    )
+                );
+            }
+
             $refreshed = self::load_effective_groups($json_dir);
             if (is_wp_error($refreshed)) {
                 return $refreshed;
@@ -328,6 +357,7 @@ if (!class_exists('RG_ACF_Schema_API')) {
             $result['schema_hash_after'] = self::compute_schema_hash($refreshed['groups']);
             $result['import_report'] = $import_report;
             $result['delete_report'] = $delete_report;
+            $result['db_delete_report'] = $db_delete_report;
             $result['source_counts_after'] = $refreshed['source_counts'];
             if (!empty($refreshed['warnings'])) {
                 $result['warnings_after'] = $refreshed['warnings'];
@@ -1126,6 +1156,89 @@ if (!class_exists('RG_ACF_Schema_API')) {
             }
 
             return $report;
+        }
+
+        private static function maybe_delete_groups_from_db($removed_group_keys)
+        {
+            $report = array(
+                'requested' => true,
+                'attempted' => 0,
+                'deleted' => 0,
+                'missing' => 0,
+                'errors' => array(),
+                'keys' => array(),
+                'missing_keys' => array(),
+            );
+
+            if (!is_array($removed_group_keys) || empty($removed_group_keys)) {
+                return $report;
+            }
+
+            if (!function_exists('acf_delete_field_group')) {
+                $report['errors'][] = 'acf_delete_field_group() is unavailable; cannot delete removed groups from DB.';
+                return $report;
+            }
+
+            foreach ($removed_group_keys as $group_key) {
+                if (!self::is_valid_group_key((string) $group_key)) {
+                    $report['errors'][] = sprintf('Invalid removed group key: %s', (string) $group_key);
+                    continue;
+                }
+
+                $report['attempted']++;
+                $group_id = self::resolve_db_group_id_by_key((string) $group_key);
+                if ($group_id <= 0) {
+                    $report['missing']++;
+                    $report['missing_keys'][] = (string) $group_key;
+                    continue;
+                }
+
+                try {
+                    $deleted = acf_delete_field_group($group_id);
+                    if (!$deleted) {
+                        $report['errors'][] = sprintf('Delete failed for %s (ID %d).', (string) $group_key, $group_id);
+                        continue;
+                    }
+                    $report['deleted']++;
+                    $report['keys'][] = (string) $group_key;
+                } catch (Throwable $e) {
+                    $report['errors'][] = sprintf('Delete failed for %s: %s', (string) $group_key, $e->getMessage());
+                }
+            }
+
+            return $report;
+        }
+
+        private static function resolve_db_group_id_by_key($group_key)
+        {
+            if (function_exists('acf_get_field_group')) {
+                $group = acf_get_field_group($group_key);
+                if (is_array($group) && isset($group['ID'])) {
+                    return (int) $group['ID'];
+                }
+            }
+
+            if (!function_exists('acf_get_field_groups')) {
+                return 0;
+            }
+
+            $groups = acf_get_field_groups();
+            if (!is_array($groups)) {
+                return 0;
+            }
+
+            foreach ($groups as $group) {
+                if (!is_array($group)) {
+                    continue;
+                }
+                $candidate_key = isset($group['key']) ? (string) $group['key'] : '';
+                if ($candidate_key !== $group_key) {
+                    continue;
+                }
+                return isset($group['ID']) ? (int) $group['ID'] : 0;
+            }
+
+            return 0;
         }
 
         private static function compute_schema_hash($group_map)

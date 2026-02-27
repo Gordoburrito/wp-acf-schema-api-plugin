@@ -36,7 +36,7 @@ curl --user "wp_user:app_password" \
 `field_groups` must be an array of ACF group JSON objects.
 `expected_hash` is optional but recommended for optimistic locking.
 `allow_field_key_changes` defaults to `false`.
-`delete_missing_groups` defaults to `false` (when `true`, deletes JSON files for groups not present in payload).
+`delete_missing_groups` defaults to `false` (when `true`, deletes groups not present in payload from JSON and ACF DB).
 
 ```bash
 curl --user "wp_user:app_password" \
@@ -95,7 +95,7 @@ Where `schema-payload.json` contains:
 - Validates nested field keys as `field_*`.
 - Fails on duplicate sibling field names at any nesting level.
 - Fails on field-key set changes for existing groups unless `allow_field_key_changes=true`.
-- Can delete groups not present in payload only when `delete_missing_groups=true`.
+- Can delete groups not present in payload only when `delete_missing_groups=true` (JSON files and matching DB field groups).
 - Use `expected_hash` on every push to avoid overwriting concurrent changes.
 
 ## Configure HMAC secret for signed push
