@@ -8,7 +8,7 @@ Usage: test-schema-api.sh [--base-url <url>] [--out-dir <path>] [--apply]
 Environment:
   WP_API_USER           Required WordPress username for API auth
   WP_API_APP_PASSWORD   Required WordPress Application Password
-  ACF_SCHEMA_API_HMAC_SECRET  Required HMAC secret for signed push requests
+  ACF_SCHEMA_API_HMAC_SECRET  Optional HMAC secret for sites that still require signed push requests
 
 This script performs:
 1) Pull schema
@@ -64,11 +64,12 @@ done
 
 require_command curl
 require_command jq
-require_command openssl
 
 [[ -n "${WP_API_USER:-}" ]] || fail "WP_API_USER is required"
 [[ -n "${WP_API_APP_PASSWORD:-}" ]] || fail "WP_API_APP_PASSWORD is required"
-[[ -n "${ACF_SCHEMA_API_HMAC_SECRET:-}" ]] || fail "ACF_SCHEMA_API_HMAC_SECRET is required"
+if [[ -n "${ACF_SCHEMA_API_HMAC_SECRET:-}" ]]; then
+  require_command openssl
+fi
 
 mkdir -p "${OUT_DIR}"
 
@@ -81,6 +82,30 @@ PUSH_DRY_RESPONSE_RAW="${OUT_DIR}/push-dry-run-response.raw.json"
 PUSH_APPLY_RESPONSE="${OUT_DIR}/push-apply-response.json"
 PUSH_APPLY_RESPONSE_RAW="${OUT_DIR}/push-apply-response.raw.json"
 PAYLOAD_FILE="${OUT_DIR}/push-payload.json"
+
+build_push_headers() {
+  local payload_file="$1"
+  PUSH_HEADERS=()
+  [[ -n "${ACF_SCHEMA_API_HMAC_SECRET:-}" ]] || return 0
+
+  local timestamp
+  local nonce
+  local body_hash
+  local canonical
+  local signature
+
+  timestamp="$(date +%s)"
+  nonce="$(openssl rand -hex 16)"
+  body_hash="$(openssl dgst -sha256 "${payload_file}" | awk '{print $NF}')"
+  canonical="$(printf 'POST\n/acf-schema/v1/push\n%s\n%s\n%s' "${timestamp}" "${nonce}" "${body_hash}")"
+  signature="$(printf '%s' "${canonical}" | openssl dgst -sha256 -hmac "${ACF_SCHEMA_API_HMAC_SECRET}" | awk '{print $NF}')"
+
+  PUSH_HEADERS=(
+    -H "X-ACF-Schema-Timestamp: ${timestamp}"
+    -H "X-ACF-Schema-Nonce: ${nonce}"
+    -H "X-ACF-Schema-Signature: ${signature}"
+  )
+}
 
 echo "Calling pull endpoint..."
 pull_tmp="$(mktemp)"
@@ -112,19 +137,12 @@ rm -f "${groups_tmp}"
 
 echo "Calling push dry-run endpoint..."
 dry_tmp="$(mktemp)"
-
-dry_timestamp="$(date +%s)"
-dry_nonce="$(openssl rand -hex 16)"
-dry_body_hash="$(openssl dgst -sha256 "${PAYLOAD_FILE}" | awk '{print $NF}')"
-dry_canonical="$(printf 'POST\n/acf-schema/v1/push\n%s\n%s\n%s' "${dry_timestamp}" "${dry_nonce}" "${dry_body_hash}")"
-dry_signature="$(printf '%s' "${dry_canonical}" | openssl dgst -sha256 -hmac "${ACF_SCHEMA_API_HMAC_SECRET}" | awk '{print $NF}')"
+build_push_headers "${PAYLOAD_FILE}"
 
 curl -sS --fail --show-error \
   --user "${WP_API_USER}:${WP_API_APP_PASSWORD}" \
   -H "Content-Type: application/json" \
-  -H "X-ACF-Schema-Timestamp: ${dry_timestamp}" \
-  -H "X-ACF-Schema-Nonce: ${dry_nonce}" \
-  -H "X-ACF-Schema-Signature: ${dry_signature}" \
+  "${PUSH_HEADERS[@]}" \
   -X POST \
   --data-binary "@${PAYLOAD_FILE}" \
   "${PUSH_URL}" > "${dry_tmp}"
@@ -146,19 +164,12 @@ if [[ "${APPLY}" -eq 1 ]]; then
 
   echo "Calling push apply endpoint..."
   apply_tmp="$(mktemp)"
-
-  apply_timestamp="$(date +%s)"
-  apply_nonce="$(openssl rand -hex 16)"
-  apply_body_hash="$(openssl dgst -sha256 "${PAYLOAD_FILE}" | awk '{print $NF}')"
-  apply_canonical="$(printf 'POST\n/acf-schema/v1/push\n%s\n%s\n%s' "${apply_timestamp}" "${apply_nonce}" "${apply_body_hash}")"
-  apply_signature="$(printf '%s' "${apply_canonical}" | openssl dgst -sha256 -hmac "${ACF_SCHEMA_API_HMAC_SECRET}" | awk '{print $NF}')"
+  build_push_headers "${PAYLOAD_FILE}"
 
   curl -sS --fail --show-error \
     --user "${WP_API_USER}:${WP_API_APP_PASSWORD}" \
     -H "Content-Type: application/json" \
-    -H "X-ACF-Schema-Timestamp: ${apply_timestamp}" \
-    -H "X-ACF-Schema-Nonce: ${apply_nonce}" \
-    -H "X-ACF-Schema-Signature: ${apply_signature}" \
+    "${PUSH_HEADERS[@]}" \
     -X POST \
     --data-binary "@${PAYLOAD_FILE}" \
     "${PUSH_URL}" > "${apply_tmp}"

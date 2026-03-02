@@ -1,6 +1,6 @@
 # ACF Schema API Plugin
 
-Adds secure REST endpoints for ACF schema pull/push.
+Adds REST endpoints for ACF schema pull/push.
 
 ## Endpoints
 - `POST /wp-json/acf-schema/v1/pull`
@@ -9,11 +9,34 @@ Adds secure REST endpoints for ACF schema pull/push.
 Both endpoints require an authenticated user with capability `manage_options` by default.
 
 ## Install
-1. Copy folder `wp-acf-schema-api-plugin` into:
-`wp-content/plugins/acf-schema-api`
-2. Activate plugin in WordPress admin.
-3. Ensure ACF is installed and active.
-4. Use an Application Password for an admin-capable user.
+1. Build or download `acf-schema-api.zip`.
+2. Upload it in WordPress under Plugins > Add Plugin > Upload Plugin, or unpack it to `wp-content/plugins/acf-schema-api/`.
+3. Activate plugin in WordPress admin.
+4. Ensure ACF is installed and active.
+5. Use an Application Password for an admin-capable user.
+
+## Build a zip
+
+Build a deployable WordPress plugin zip locally:
+
+```bash
+./scripts/build-zip.sh
+```
+
+This writes:
+- `dist/acf-schema-api-<version>.zip`
+- `dist/acf-schema-api.zip`
+
+The zip expands to `acf-schema-api/`, so it can be uploaded directly in WordPress or unpacked into `wp-content/plugins/acf-schema-api/`.
+
+## GitHub automation
+
+GitHub Actions rebuilds the zip on every push with `.github/workflows/build-zip.yml`.
+
+- Every push uploads fresh zip files as a workflow artifact.
+- Every git tag publishes the zip files to the corresponding GitHub release.
+
+This is the reliable way to keep the zip up to date. Committing built zip files into git is possible, but it creates noisy binary diffs and usually ages badly.
 
 ### Plesk shell note
 If `wp` fails with `/usr/bin/env: 'php': No such file or directory`, run WP-CLI with a PHP path prefix:
@@ -90,7 +113,8 @@ Where `schema-payload.json` contains:
   - from `acf_get_setting('load_json')` JSON files, preferring the newest duplicate group by `modified` (then file mtime)
   - then DB-only field groups not present in JSON
 - Strict JSON mode is enabled by default (`acf_schema_api_strict_json_only`).
-- Push requests require signed headers by default (`acf_schema_api_require_signed_push`).
+- Push requests rely on authenticated WordPress users with the required capability by default.
+- Signed push headers are optional and can be re-enabled with `acf_schema_api_require_signed_push`.
 - Validates group keys as `group_*`.
 - Validates nested field keys as `field_*`.
 - Fails on duplicate sibling field names at any nesting level.
@@ -98,10 +122,11 @@ Where `schema-payload.json` contains:
 - Can delete groups not present in payload only when `delete_missing_groups=true` (JSON files and matching DB field groups).
 - Use `expected_hash` on every push to avoid overwriting concurrent changes.
 
-## Configure HMAC secret for signed push
-Set a server-side secret in `wp-config.php`:
+## Optional signed push hardening
+If you want an extra shared-secret layer on top of WordPress auth, enable the filter and set a server-side secret in `wp-config.php`:
 
 ```php
+add_filter('acf_schema_api_require_signed_push', '__return_true');
 define('ACF_SCHEMA_API_HMAC_SECRET', 'replace-with-long-random-secret');
 ```
 
@@ -119,6 +144,7 @@ Route for push:
 ## Optional filters
 - `acf_schema_api_required_capability` (default `manage_options`)
 - `acf_schema_api_json_dir` (default `WP_CONTENT_DIR . '/acf-json'`)
+- `acf_schema_api_require_signed_push` (default `false`)
 
 ## Local test script
 Use `test-schema-api.sh` for pull + push dry-run verification.
@@ -126,8 +152,13 @@ Use `test-schema-api.sh` for pull + push dry-run verification.
 ```bash
 export WP_API_USER='admin-user'
 export WP_API_APP_PASSWORD='app password here'
-export ACF_SCHEMA_API_HMAC_SECRET='your-shared-hmac-secret'
 ./test-schema-api.sh --base-url https://example.com
+```
+
+If the site is configured to require signed push requests, also set:
+
+```bash
+export ACF_SCHEMA_API_HMAC_SECRET='your-shared-hmac-secret'
 ```
 
 Add `--apply` only after dry-run is verified.

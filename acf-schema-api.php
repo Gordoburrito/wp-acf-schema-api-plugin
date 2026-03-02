@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: ACF Schema API
- * Description: Secure REST endpoints to pull and push ACF schema JSON (field groups) with dry-run and hash lock support.
- * Version: 1.3.3
+ * Description: REST endpoints to pull and push ACF schema JSON (field groups) with dry-run and hash lock support.
+ * Version: 1.4.0
  * Author: RG Ops
  */
 
@@ -124,9 +124,9 @@ if (!class_exists('RG_ACF_Schema_API')) {
 
         public static function handle_push(WP_REST_Request $request)
         {
-            $signature_check = self::verify_signed_push_request($request);
-            if (is_wp_error($signature_check)) {
-                return $signature_check;
+            $signature_state = self::verify_signed_push_request($request);
+            if (is_wp_error($signature_state)) {
+                return $signature_state;
             }
 
             $json_dir = self::get_json_dir();
@@ -210,7 +210,8 @@ if (!class_exists('RG_ACF_Schema_API')) {
                 'delete_missing_groups' => $delete_missing_groups,
                 'plan' => $plan,
                 'source_counts' => $state['source_counts'],
-                'signature_verified' => true,
+                'signature_required' => !empty($signature_state['required']),
+                'signature_verified' => !empty($signature_state['verified']),
             );
 
             if (!empty($state['warnings'])) {
@@ -627,7 +628,7 @@ if (!class_exists('RG_ACF_Schema_API')) {
 
         private static function should_require_signed_push()
         {
-            return (bool) apply_filters('acf_schema_api_require_signed_push', true);
+            return (bool) apply_filters('acf_schema_api_require_signed_push', false);
         }
 
         private static function should_import_groups_to_db()
@@ -657,7 +658,10 @@ if (!class_exists('RG_ACF_Schema_API')) {
         private static function verify_signed_push_request(WP_REST_Request $request)
         {
             if (!self::should_require_signed_push()) {
-                return true;
+                return array(
+                    'required' => false,
+                    'verified' => false,
+                );
             }
 
             $secret = self::resolve_hmac_secret();
@@ -751,7 +755,10 @@ if (!class_exists('RG_ACF_Schema_API')) {
                 );
             }
 
-            return true;
+            return array(
+                'required' => true,
+                'verified' => true,
+            );
         }
 
         private static function load_db_only_groups($existing_group_keys)
