@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: ACF Schema API
- * Description: REST endpoints to pull and push ACF schema JSON (field groups) with dry-run and hash lock support.
- * Version: 1.4.0
+ * Description: REST endpoints to pull and push ACF schema JSON plus plugin-managed bootstrap and content APIs for local automation.
+ * Version: 1.5.0
  * Author: RG Ops
  */
 
@@ -14,11 +14,23 @@ if (!class_exists('RG_ACF_Schema_API')) {
     final class RG_ACF_Schema_API
     {
         const ROUTE_NAMESPACE = 'acf-schema/v1';
+        const AUTOMATION_ROUTE_NAMESPACE = 'acf-automation/v1';
         const NONCE_TRANSIENT_PREFIX = 'acf_schema_api_nonce_';
+        const OPTION_AUTOMATION_SITE_ID = 'acf_automation_site_id';
+        const OPTION_AUTOMATION_SECRET_HASH = 'acf_automation_secret_hash';
+        const OPTION_AUTOMATION_CLAIM_TOKEN_HASH = 'acf_automation_claim_token_hash';
+        const OPTION_AUTOMATION_CLAIM_EXPIRES_AT = 'acf_automation_claim_expires_at';
+        const OPTION_AUTOMATION_ALLOWED_RESOURCE_TYPES = 'acf_automation_allowed_resource_types';
+        const OPTION_AUTOMATION_ENABLED = 'acf_automation_enabled';
+        const CLAIM_TOKEN_TTL = DAY_IN_SECONDS;
+        const ADMIN_PAGE_SLUG = 'acf-codex-automation';
+        const HEADER_AUTOMATION_SITE = 'x-acf-automation-site';
+        const HEADER_AUTOMATION_SECRET = 'x-acf-automation-secret';
 
         public static function init()
         {
             add_action('rest_api_init', array(__CLASS__, 'register_routes'));
+            add_action('admin_menu', array(__CLASS__, 'register_admin_page'));
         }
 
         public static function register_routes()
@@ -29,7 +41,7 @@ if (!class_exists('RG_ACF_Schema_API')) {
                 array(
                     'methods' => WP_REST_Server::CREATABLE,
                     'callback' => array(__CLASS__, 'handle_pull'),
-                    'permission_callback' => array(__CLASS__, 'permission_check'),
+                    'permission_callback' => array(__CLASS__, 'schema_permission_check'),
                     'args' => array(
                         'include_groups' => array(
                             'type' => 'boolean',
@@ -46,7 +58,7 @@ if (!class_exists('RG_ACF_Schema_API')) {
                 array(
                     'methods' => WP_REST_Server::CREATABLE,
                     'callback' => array(__CLASS__, 'handle_push'),
-                    'permission_callback' => array(__CLASS__, 'permission_check'),
+                    'permission_callback' => array(__CLASS__, 'schema_permission_check'),
                     'args' => array(
                         'field_groups' => array(
                             'type' => 'array',
@@ -74,20 +86,829 @@ if (!class_exists('RG_ACF_Schema_API')) {
                     ),
                 )
             );
+
+            register_rest_route(
+                self::AUTOMATION_ROUTE_NAMESPACE,
+                '/bootstrap/status',
+                array(
+                    'methods' => WP_REST_Server::READABLE,
+                    'callback' => array(__CLASS__, 'handle_bootstrap_status'),
+                    'permission_callback' => array(__CLASS__, 'bootstrap_status_permission_check'),
+                )
+            );
+
+            register_rest_route(
+                self::AUTOMATION_ROUTE_NAMESPACE,
+                '/bootstrap/claim',
+                array(
+                    'methods' => WP_REST_Server::CREATABLE,
+                    'callback' => array(__CLASS__, 'handle_bootstrap_claim'),
+                    'permission_callback' => '__return_true',
+                    'args' => array(
+                        'claim_token' => array(
+                            'type' => 'string',
+                            'required' => true,
+                        ),
+                    ),
+                )
+            );
+
+            register_rest_route(
+                self::AUTOMATION_ROUTE_NAMESPACE,
+                '/bootstrap/rotate',
+                array(
+                    'methods' => WP_REST_Server::CREATABLE,
+                    'callback' => array(__CLASS__, 'handle_bootstrap_rotate'),
+                    'permission_callback' => array(__CLASS__, 'admin_permission_check'),
+                )
+            );
+
+            register_rest_route(
+                self::AUTOMATION_ROUTE_NAMESPACE,
+                '/content/(?P<resource_type>[A-Za-z0-9_-]+)/(?P<resource_id>[0-9]+)',
+                array(
+                    array(
+                        'methods' => WP_REST_Server::READABLE,
+                        'callback' => array(__CLASS__, 'handle_content_get'),
+                        'permission_callback' => array(__CLASS__, 'content_permission_check'),
+                    ),
+                    array(
+                        'methods' => WP_REST_Server::CREATABLE,
+                        'callback' => array(__CLASS__, 'handle_content_post'),
+                        'permission_callback' => array(__CLASS__, 'content_permission_check'),
+                        'args' => array(
+                            'dry_run' => array(
+                                'type' => 'boolean',
+                                'required' => false,
+                                'default' => false,
+                            ),
+                        ),
+                    ),
+                )
+            );
+        }
+
+        public static function activate()
+        {
+            self::ensure_automation_defaults();
+            self::maybe_issue_claim_token(false);
+        }
+
+        public static function schema_permission_check(WP_REST_Request $request)
+        {
+            $auth = self::authenticate_request(
+                $request,
+                array(
+                    'allow_plugin_secret' => true,
+                    'allow_admin' => true,
+                    'capability' => self::required_capability(),
+                )
+            );
+
+            if (is_wp_error($auth)) {
+                return $auth;
+            }
+
+            return true;
+        }
+
+        public static function bootstrap_status_permission_check(WP_REST_Request $request)
+        {
+            $auth = self::authenticate_request(
+                $request,
+                array(
+                    'allow_plugin_secret' => true,
+                    'allow_admin' => true,
+                    'capability' => self::required_capability(),
+                )
+            );
+
+            if (is_wp_error($auth)) {
+                return $auth;
+            }
+
+            return true;
+        }
+
+        public static function admin_permission_check(WP_REST_Request $request)
+        {
+            $auth = self::authenticate_request(
+                $request,
+                array(
+                    'allow_plugin_secret' => false,
+                    'allow_admin' => true,
+                    'capability' => self::required_capability(),
+                )
+            );
+
+            if (is_wp_error($auth)) {
+                return $auth;
+            }
+
+            return true;
+        }
+
+        public static function content_permission_check(WP_REST_Request $request)
+        {
+            $auth = self::authenticate_request(
+                $request,
+                array(
+                    'allow_plugin_secret' => true,
+                    'allow_admin' => true,
+                    'capability' => self::required_capability(),
+                )
+            );
+
+            if (is_wp_error($auth)) {
+                return $auth;
+            }
+
+            return true;
         }
 
         public static function permission_check(WP_REST_Request $request)
         {
-            $cap = apply_filters('acf_schema_api_required_capability', 'manage_options');
-            if (is_user_logged_in() && current_user_can($cap)) {
-                return true;
+            return self::schema_permission_check($request);
+        }
+
+        public static function register_admin_page()
+        {
+            add_options_page(
+                'Codex Automation',
+                'Codex Automation',
+                self::required_capability(),
+                self::ADMIN_PAGE_SLUG,
+                array(__CLASS__, 'render_admin_page')
+            );
+        }
+
+        public static function render_admin_page()
+        {
+            if (!current_user_can(self::required_capability())) {
+                wp_die('Insufficient permissions.');
+            }
+
+            self::ensure_automation_defaults();
+
+            $notice = '';
+            $notice_type = 'updated';
+            $claim_token = '';
+
+            if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+                check_admin_referer('acf_automation_admin_action', 'acf_automation_nonce');
+                $action = isset($_POST['acf_automation_action']) ? sanitize_key((string) $_POST['acf_automation_action']) : '';
+
+                if ($action === 'generate_claim_token') {
+                    $claim_token = self::maybe_issue_claim_token(true);
+                    $notice = 'Generated a new one-time claim token.';
+                } elseif ($action === 'rotate_secret') {
+                    self::clear_automation_secret();
+                    $claim_token = self::maybe_issue_claim_token(true);
+                    $notice = 'Rotated automation access. Previous automation secret is now invalid, and a new claim token has been issued.';
+                } elseif ($action === 'disable_automation') {
+                    update_option(self::OPTION_AUTOMATION_ENABLED, false, false);
+                    self::clear_automation_secret();
+                    self::clear_claim_token();
+                    $notice = 'Automation has been disabled.';
+                    $notice_type = 'notice-warning';
+                } elseif ($action === 'enable_automation') {
+                    update_option(self::OPTION_AUTOMATION_ENABLED, true, false);
+                    $claim_token = self::maybe_issue_claim_token(true);
+                    $notice = 'Automation has been enabled.';
+                }
+            }
+
+            if ($claim_token === '' && !self::is_automation_claimed() && self::is_automation_enabled()) {
+                $claim_token = self::maybe_issue_claim_token(true);
+            }
+
+            $status = self::build_bootstrap_status_payload(true, $claim_token);
+            $claim_command = '';
+            if (!empty($status['claim_token'])) {
+                $claim_command = sprintf(
+                    'scripts/bootstrap-repo.sh --claim-token %s',
+                    $status['claim_token']
+                );
+            }
+            ?>
+            <div class="wrap">
+                <h1>Codex Automation</h1>
+                <?php if ($notice !== '') : ?>
+                    <div class="notice <?php echo esc_attr($notice_type); ?> is-dismissible"><p><?php echo esc_html($notice); ?></p></div>
+                <?php endif; ?>
+                <table class="widefat striped" style="max-width: 960px;">
+                    <tbody>
+                        <tr><th>Status</th><td><?php echo esc_html($status['claimed'] ? 'Claimed' : 'Unclaimed'); ?></td></tr>
+                        <tr><th>Enabled</th><td><?php echo esc_html($status['enabled'] ? 'Yes' : 'No'); ?></td></tr>
+                        <tr><th>Site ID</th><td><code><?php echo esc_html($status['site_id']); ?></code></td></tr>
+                        <tr><th>Allowed resource types</th><td><code><?php echo esc_html(implode(',', $status['allowed_resource_types'])); ?></code></td></tr>
+                        <tr><th>Schema pull path</th><td><code><?php echo esc_html($status['schema_pull_path']); ?></code></td></tr>
+                        <tr><th>Schema push path</th><td><code><?php echo esc_html($status['schema_push_path']); ?></code></td></tr>
+                        <tr><th>Content path</th><td><code><?php echo esc_html($status['content_base_path']); ?></code></td></tr>
+                        <?php if (!empty($status['claim_token'])) : ?>
+                            <tr><th>Claim token</th><td><code><?php echo esc_html($status['claim_token']); ?></code></td></tr>
+                            <tr><th>Claim command</th><td><code><?php echo esc_html($claim_command); ?></code></td></tr>
+                            <tr><th>Expires at</th><td><code><?php echo esc_html($status['claim_expires_at']); ?></code></td></tr>
+                        <?php endif; ?>
+                    </tbody>
+                </table>
+
+                <form method="post" style="margin-top: 16px;">
+                    <?php wp_nonce_field('acf_automation_admin_action', 'acf_automation_nonce'); ?>
+                    <?php if ($status['enabled']) : ?>
+                        <?php if ($status['claimed']) : ?>
+                            <input type="hidden" name="acf_automation_action" value="rotate_secret" />
+                            <?php submit_button('Rotate Automation Secret and Issue Claim Token', 'secondary', 'submit', false); ?>
+                        <?php else : ?>
+                            <input type="hidden" name="acf_automation_action" value="generate_claim_token" />
+                            <?php submit_button('Generate New Claim Token', 'secondary', 'submit', false); ?>
+                        <?php endif; ?>
+                    <?php else : ?>
+                        <input type="hidden" name="acf_automation_action" value="enable_automation" />
+                        <?php submit_button('Enable Automation', 'primary', 'submit', false); ?>
+                    <?php endif; ?>
+                </form>
+
+                <form method="post" style="margin-top: 8px;">
+                    <?php wp_nonce_field('acf_automation_admin_action', 'acf_automation_nonce'); ?>
+                    <input type="hidden" name="acf_automation_action" value="disable_automation" />
+                    <?php submit_button('Disable Automation', 'delete', 'submit', false, array('onclick' => "return confirm('Disable automation and invalidate existing credentials?');")); ?>
+                </form>
+            </div>
+            <?php
+        }
+
+        public static function handle_bootstrap_status(WP_REST_Request $request)
+        {
+            $auth = self::authenticate_request(
+                $request,
+                array(
+                    'allow_plugin_secret' => true,
+                    'allow_admin' => true,
+                    'capability' => self::required_capability(),
+                )
+            );
+            if (is_wp_error($auth)) {
+                return $auth;
+            }
+
+            $include_claim_token = ($auth['mode'] === 'admin');
+            $claim_token = '';
+            if ($include_claim_token && !self::is_automation_claimed() && self::is_automation_enabled()) {
+                $claim_token = self::maybe_issue_claim_token(true);
+            }
+
+            return rest_ensure_response(self::build_bootstrap_status_payload($include_claim_token, $claim_token));
+        }
+
+        public static function handle_bootstrap_claim(WP_REST_Request $request)
+        {
+            $https = self::ensure_https_request();
+            if (is_wp_error($https)) {
+                return $https;
+            }
+
+            self::ensure_automation_defaults();
+            if (!self::is_automation_enabled()) {
+                return new WP_Error(
+                    'acf_automation_disabled',
+                    'Automation is disabled for this site.',
+                    array('status' => 403)
+                );
+            }
+
+            $claim_token = trim((string) $request->get_param('claim_token'));
+            if ($claim_token === '') {
+                return new WP_Error(
+                    'acf_automation_missing_claim_token',
+                    'claim_token is required.',
+                    array('status' => 400)
+                );
+            }
+
+            $validation = self::validate_claim_token($claim_token);
+            if (is_wp_error($validation)) {
+                return $validation;
+            }
+
+            $secret = self::generate_secret(32);
+            update_option(self::OPTION_AUTOMATION_SECRET_HASH, wp_hash_password($secret), false);
+            self::clear_claim_token();
+
+            $payload = self::build_bootstrap_status_payload(false, '');
+            $payload['automation_secret'] = $secret;
+            return rest_ensure_response($payload);
+        }
+
+        public static function handle_bootstrap_rotate(WP_REST_Request $request)
+        {
+            $auth = self::authenticate_request(
+                $request,
+                array(
+                    'allow_plugin_secret' => false,
+                    'allow_admin' => true,
+                    'capability' => self::required_capability(),
+                )
+            );
+            if (is_wp_error($auth)) {
+                return $auth;
+            }
+
+            self::ensure_automation_defaults();
+            self::clear_automation_secret();
+            $claim_token = self::maybe_issue_claim_token(true);
+
+            return rest_ensure_response(self::build_bootstrap_status_payload(true, $claim_token));
+        }
+
+        public static function handle_content_get(WP_REST_Request $request)
+        {
+            $auth = self::authenticate_request(
+                $request,
+                array(
+                    'allow_plugin_secret' => true,
+                    'allow_admin' => true,
+                    'capability' => self::required_capability(),
+                )
+            );
+            if (is_wp_error($auth)) {
+                return $auth;
+            }
+
+            $resource_type = sanitize_key((string) $request['resource_type']);
+            $resource_id = (int) $request['resource_id'];
+            $post = self::load_content_resource($resource_type, $resource_id);
+            if (is_wp_error($post)) {
+                return $post;
+            }
+
+            $response = self::build_content_response($resource_type, $post, false, array());
+            if (is_wp_error($response)) {
+                return $response;
+            }
+
+            return rest_ensure_response($response);
+        }
+
+        public static function handle_content_post(WP_REST_Request $request)
+        {
+            $auth = self::authenticate_request(
+                $request,
+                array(
+                    'allow_plugin_secret' => true,
+                    'allow_admin' => true,
+                    'capability' => self::required_capability(),
+                )
+            );
+            if (is_wp_error($auth)) {
+                return $auth;
+            }
+
+            $resource_type = sanitize_key((string) $request['resource_type']);
+            $resource_id = (int) $request['resource_id'];
+            $post = self::load_content_resource($resource_type, $resource_id);
+            if (is_wp_error($post)) {
+                return $post;
+            }
+
+            $payload = $request->get_json_params();
+            if (!is_array($payload) || array_diff(array_keys($payload), array('acf')) !== array()) {
+                return new WP_Error(
+                    'acf_automation_bad_payload',
+                    "Payload must be a JSON object with only an 'acf' object.",
+                    array('status' => 400)
+                );
+            }
+            if (!isset($payload['acf']) || !is_array($payload['acf'])) {
+                return new WP_Error(
+                    'acf_automation_bad_payload',
+                    "Payload must include an 'acf' object.",
+                    array('status' => 400)
+                );
+            }
+
+            $dry_run = rest_sanitize_boolean($request->get_param('dry_run'));
+            $requested_fields = array_keys($payload['acf']);
+
+            if (!$dry_run) {
+                $apply = self::apply_content_update($post->ID, $payload['acf']);
+                if (is_wp_error($apply)) {
+                    return $apply;
+                }
+            }
+
+            $response = self::build_content_response($resource_type, get_post($post->ID), $dry_run, $requested_fields);
+            if (is_wp_error($response)) {
+                return $response;
+            }
+
+            return rest_ensure_response($response);
+        }
+
+        private static function required_capability()
+        {
+            return (string) apply_filters('acf_automation_required_capability', apply_filters('acf_schema_api_required_capability', 'manage_options'));
+        }
+
+        private static function authenticate_request(WP_REST_Request $request, $args = array())
+        {
+            $args = wp_parse_args(
+                $args,
+                array(
+                    'allow_plugin_secret' => true,
+                    'allow_admin' => true,
+                    'capability' => self::required_capability(),
+                )
+            );
+
+            if ($args['allow_plugin_secret'] && self::has_plugin_secret_headers($request)) {
+                $plugin_auth = self::authenticate_plugin_secret($request);
+                if (is_wp_error($plugin_auth)) {
+                    return $plugin_auth;
+                }
+                return $plugin_auth;
+            }
+
+            if ($args['allow_admin'] && is_user_logged_in() && current_user_can($args['capability'])) {
+                return array('mode' => 'admin');
             }
 
             return new WP_Error(
-                'acf_schema_api_forbidden',
-                sprintf('Authentication required with capability: %s', esc_html($cap)),
+                'acf_automation_forbidden',
+                sprintf('Authentication required with capability: %s', esc_html($args['capability'])),
                 array('status' => 403)
             );
+        }
+
+        private static function has_plugin_secret_headers(WP_REST_Request $request)
+        {
+            return trim((string) $request->get_header(self::HEADER_AUTOMATION_SITE)) !== '' || trim((string) $request->get_header(self::HEADER_AUTOMATION_SECRET)) !== '';
+        }
+
+        private static function authenticate_plugin_secret(WP_REST_Request $request)
+        {
+            if (!self::is_automation_enabled()) {
+                return new WP_Error(
+                    'acf_automation_disabled',
+                    'Automation is disabled for this site.',
+                    array('status' => 403)
+                );
+            }
+
+            $https = self::ensure_https_request();
+            if (is_wp_error($https)) {
+                return $https;
+            }
+
+            $site_id = trim((string) $request->get_header(self::HEADER_AUTOMATION_SITE));
+            $secret = trim((string) $request->get_header(self::HEADER_AUTOMATION_SECRET));
+            if ($site_id === '' || $secret === '') {
+                return new WP_Error(
+                    'acf_automation_missing_headers',
+                    'Missing automation authentication headers.',
+                    array('status' => 401)
+                );
+            }
+
+            $stored_site_id = (string) get_option(self::OPTION_AUTOMATION_SITE_ID, '');
+            $secret_hash = (string) get_option(self::OPTION_AUTOMATION_SECRET_HASH, '');
+            if ($stored_site_id === '' || $secret_hash === '') {
+                return new WP_Error(
+                    'acf_automation_unclaimed',
+                    'Automation secret has not been claimed for this site.',
+                    array('status' => 401)
+                );
+            }
+
+            if (!hash_equals($stored_site_id, $site_id)) {
+                return new WP_Error(
+                    'acf_automation_bad_site',
+                    'Automation site ID did not match this site.',
+                    array('status' => 401)
+                );
+            }
+
+            if (!wp_check_password($secret, $secret_hash)) {
+                return new WP_Error(
+                    'acf_automation_bad_secret',
+                    'Automation secret verification failed.',
+                    array('status' => 401)
+                );
+            }
+
+            return array(
+                'mode' => 'plugin_secret',
+                'site_id' => $stored_site_id,
+            );
+        }
+
+        private static function ensure_https_request()
+        {
+            $secure = is_ssl();
+            if (!$secure && isset($_SERVER['HTTP_X_FORWARDED_PROTO'])) {
+                $secure = strtolower((string) $_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https';
+            }
+            if (!$secure && isset($_SERVER['HTTP_X_FORWARDED_SSL'])) {
+                $secure = strtolower((string) $_SERVER['HTTP_X_FORWARDED_SSL']) === 'on';
+            }
+
+            if (!$secure) {
+                return new WP_Error(
+                    'acf_automation_https_required',
+                    'Automation secret flows require HTTPS.',
+                    array('status' => 400)
+                );
+            }
+
+            return true;
+        }
+
+        private static function ensure_automation_defaults()
+        {
+            $site_id = (string) get_option(self::OPTION_AUTOMATION_SITE_ID, '');
+            if ($site_id === '') {
+                update_option(self::OPTION_AUTOMATION_SITE_ID, self::generate_site_id(), false);
+            }
+
+            if (get_option(self::OPTION_AUTOMATION_ENABLED, null) === null) {
+                update_option(self::OPTION_AUTOMATION_ENABLED, true, false);
+            }
+
+            if (!is_array(get_option(self::OPTION_AUTOMATION_ALLOWED_RESOURCE_TYPES, null))) {
+                update_option(self::OPTION_AUTOMATION_ALLOWED_RESOURCE_TYPES, self::default_allowed_resource_types(), false);
+            }
+        }
+
+        private static function generate_site_id()
+        {
+            $raw = function_exists('wp_generate_uuid4') ? wp_generate_uuid4() : uniqid('acf-site-', true);
+            return 'site_' . preg_replace('/[^A-Za-z0-9_-]/', '', str_replace('.', '', (string) $raw));
+        }
+
+        private static function default_allowed_resource_types()
+        {
+            $types = array('pages', 'posts');
+            $filtered = apply_filters('acf_automation_allowed_resource_types', $types);
+            if (!is_array($filtered) || empty($filtered)) {
+                return $types;
+            }
+
+            $normalized = array();
+            foreach ($filtered as $type) {
+                $type = sanitize_key((string) $type);
+                if ($type !== '') {
+                    $normalized[] = $type;
+                }
+            }
+
+            return array_values(array_unique($normalized));
+        }
+
+        private static function is_automation_enabled()
+        {
+            return (bool) get_option(self::OPTION_AUTOMATION_ENABLED, true);
+        }
+
+        private static function is_automation_claimed()
+        {
+            return trim((string) get_option(self::OPTION_AUTOMATION_SECRET_HASH, '')) !== '';
+        }
+
+        private static function clear_claim_token()
+        {
+            delete_option(self::OPTION_AUTOMATION_CLAIM_TOKEN_HASH);
+            delete_option(self::OPTION_AUTOMATION_CLAIM_EXPIRES_AT);
+        }
+
+        private static function clear_automation_secret()
+        {
+            delete_option(self::OPTION_AUTOMATION_SECRET_HASH);
+        }
+
+        private static function maybe_issue_claim_token($force)
+        {
+            $now = time();
+            $expires_at = (int) get_option(self::OPTION_AUTOMATION_CLAIM_EXPIRES_AT, 0);
+            if (!$force && $expires_at > $now && trim((string) get_option(self::OPTION_AUTOMATION_CLAIM_TOKEN_HASH, '')) !== '') {
+                return '';
+            }
+
+            $claim_token = self::generate_secret(20);
+            update_option(self::OPTION_AUTOMATION_CLAIM_TOKEN_HASH, wp_hash_password($claim_token), false);
+            update_option(self::OPTION_AUTOMATION_CLAIM_EXPIRES_AT, $now + self::CLAIM_TOKEN_TTL, false);
+
+            return $claim_token;
+        }
+
+        private static function validate_claim_token($claim_token)
+        {
+            $claim_hash = trim((string) get_option(self::OPTION_AUTOMATION_CLAIM_TOKEN_HASH, ''));
+            $expires_at = (int) get_option(self::OPTION_AUTOMATION_CLAIM_EXPIRES_AT, 0);
+            if ($claim_hash === '' || $expires_at <= 0) {
+                return new WP_Error(
+                    'acf_automation_claim_missing',
+                    'No active claim token is available for this site.',
+                    array('status' => 409)
+                );
+            }
+
+            if (time() > $expires_at) {
+                self::clear_claim_token();
+                return new WP_Error(
+                    'acf_automation_claim_expired',
+                    'Claim token has expired.',
+                    array('status' => 410)
+                );
+            }
+
+            if (!wp_check_password($claim_token, $claim_hash)) {
+                return new WP_Error(
+                    'acf_automation_claim_invalid',
+                    'Claim token is invalid.',
+                    array('status' => 401)
+                );
+            }
+
+            return true;
+        }
+
+        private static function generate_secret($bytes)
+        {
+            try {
+                return bin2hex(random_bytes($bytes));
+            } catch (Throwable $e) {
+                return bin2hex(wp_generate_password($bytes * 2, true, true));
+            }
+        }
+
+        private static function build_bootstrap_status_payload($include_claim_token, $claim_token)
+        {
+            self::ensure_automation_defaults();
+
+            $payload = array(
+                'enabled' => self::is_automation_enabled(),
+                'claimed' => self::is_automation_claimed(),
+                'site_id' => (string) get_option(self::OPTION_AUTOMATION_SITE_ID, ''),
+                'allowed_resource_types' => self::resolve_allowed_resource_types(),
+                'target_base_url' => home_url('/'),
+                'schema_pull_path' => '/wp-json/' . self::ROUTE_NAMESPACE . '/pull',
+                'schema_push_path' => '/wp-json/' . self::ROUTE_NAMESPACE . '/push',
+                'content_base_path' => '/wp-json/' . self::AUTOMATION_ROUTE_NAMESPACE . '/content',
+                'claim_expires_at' => '',
+            );
+
+            if ($include_claim_token && !$payload['claimed'] && $claim_token !== '') {
+                $payload['claim_token'] = $claim_token;
+                $payload['claim_url'] = home_url('/wp-json/' . self::AUTOMATION_ROUTE_NAMESPACE . '/bootstrap/claim?claim_token=' . rawurlencode($claim_token));
+                $expires_at = (int) get_option(self::OPTION_AUTOMATION_CLAIM_EXPIRES_AT, 0);
+                $payload['claim_expires_at'] = $expires_at > 0 ? gmdate('c', $expires_at) : '';
+                $payload['bootstrap_command'] = sprintf('scripts/bootstrap-repo.sh --claim-token %s', $claim_token);
+            }
+
+            return $payload;
+        }
+
+        private static function resolve_allowed_resource_types()
+        {
+            $types = get_option(self::OPTION_AUTOMATION_ALLOWED_RESOURCE_TYPES, self::default_allowed_resource_types());
+            if (!is_array($types) || empty($types)) {
+                $types = self::default_allowed_resource_types();
+            }
+
+            return array_values(array_unique(array_map('sanitize_key', $types)));
+        }
+
+        private static function resolve_post_type_for_resource($resource_type)
+        {
+            $resource_type = sanitize_key((string) $resource_type);
+            if ($resource_type === '') {
+                return '';
+            }
+
+            if (!in_array($resource_type, self::resolve_allowed_resource_types(), true)) {
+                return '';
+            }
+
+            $post_types = get_post_types(array('show_in_rest' => true), 'objects');
+            foreach ($post_types as $post_type => $object) {
+                $rest_base = !empty($object->rest_base) ? sanitize_key((string) $object->rest_base) : sanitize_key((string) $post_type);
+                if ($rest_base === $resource_type || sanitize_key((string) $post_type) === $resource_type) {
+                    return (string) $post_type;
+                }
+            }
+
+            return '';
+        }
+
+        private static function load_content_resource($resource_type, $resource_id)
+        {
+            if ($resource_id <= 0) {
+                return new WP_Error(
+                    'acf_automation_bad_id',
+                    'resource_id must be a positive integer.',
+                    array('status' => 400)
+                );
+            }
+
+            $post_type = self::resolve_post_type_for_resource($resource_type);
+            if ($post_type === '') {
+                return new WP_Error(
+                    'acf_automation_bad_resource_type',
+                    sprintf('resource_type %s is not allowlisted.', esc_html((string) $resource_type)),
+                    array('status' => 400)
+                );
+            }
+
+            $post = get_post($resource_id);
+            if (!$post instanceof WP_Post) {
+                return new WP_Error(
+                    'acf_automation_not_found',
+                    'Resource not found.',
+                    array('status' => 404)
+                );
+            }
+
+            if ($post->post_type !== $post_type) {
+                return new WP_Error(
+                    'acf_automation_type_mismatch',
+                    'Resource exists but does not match the requested resource type.',
+                    array('status' => 400)
+                );
+            }
+
+            return $post;
+        }
+
+        private static function load_acf_values($post_id)
+        {
+            if (!function_exists('get_fields')) {
+                return new WP_Error(
+                    'acf_automation_acf_missing',
+                    'ACF functions are unavailable.',
+                    array('status' => 500)
+                );
+            }
+
+            $fields = get_fields($post_id, false);
+            if (!is_array($fields)) {
+                return array();
+            }
+
+            return $fields;
+        }
+
+        private static function build_content_response($resource_type, $post, $dry_run, $requested_fields)
+        {
+            $acf = self::load_acf_values($post->ID);
+            if (is_wp_error($acf)) {
+                return $acf;
+            }
+
+            return array(
+                'id' => (int) $post->ID,
+                'type' => (string) $resource_type,
+                'post_type' => (string) $post->post_type,
+                'status' => (string) $post->post_status,
+                'slug' => (string) $post->post_name,
+                'title' => (string) $post->post_title,
+                'dry_run' => (bool) $dry_run,
+                'requested_fields' => array_values($requested_fields),
+                'acf' => $acf,
+            );
+        }
+
+        private static function apply_content_update($post_id, $acf_payload)
+        {
+            if (!function_exists('update_field')) {
+                return new WP_Error(
+                    'acf_automation_acf_missing',
+                    'ACF update_field() is unavailable.',
+                    array('status' => 500)
+                );
+            }
+
+            foreach ($acf_payload as $field_name => $value) {
+                $field_name = sanitize_key((string) $field_name);
+                if ($field_name === '') {
+                    return new WP_Error(
+                        'acf_automation_bad_field_name',
+                        'ACF payload contains an invalid field name.',
+                        array('status' => 400)
+                    );
+                }
+
+                try {
+                    update_field($field_name, $value, $post_id);
+                } catch (Throwable $e) {
+                    return new WP_Error(
+                        'acf_automation_update_failed',
+                        sprintf('Failed updating field %s: %s', $field_name, $e->getMessage()),
+                        array('status' => 500)
+                    );
+                }
+            }
+
+            return true;
         }
 
         public static function handle_pull(WP_REST_Request $request)
@@ -1309,4 +2130,5 @@ if (!class_exists('RG_ACF_Schema_API')) {
     }
 }
 
+register_activation_hook(__FILE__, array('RG_ACF_Schema_API', 'activate'));
 RG_ACF_Schema_API::init();
