@@ -113,6 +113,8 @@ Where `schema-payload.json` contains:
   - from `acf_get_setting('load_json')` JSON files, preferring the newest duplicate group by `modified` (then file mtime)
   - then DB-only field groups not present in JSON
 - Strict JSON mode is enabled by default (`acf_schema_api_strict_json_only`).
+- The WordPress `Settings > AI Automation` page now shows DB-only field groups and can export them to JSON.
+- Optional auto-heal: enable auto-export from `Settings > AI Automation`, or override it with `acf_schema_api_auto_export_db_only_groups`, to export DB-only groups automatically during pull/push before strict mode fails.
 - Push requests rely on authenticated WordPress users with the required capability by default.
 - Signed push headers are optional and can be re-enabled with `acf_schema_api_require_signed_push`.
 - Validates group keys as `group_*`.
@@ -144,6 +146,7 @@ Route for push:
 ## Optional filters
 - `acf_schema_api_required_capability` (default `manage_options`)
 - `acf_schema_api_json_dir` (default `WP_CONTENT_DIR . '/acf-json'`)
+- `acf_schema_api_auto_export_db_only_groups` (default `false`)
 - `acf_schema_api_require_signed_push` (default `false`)
 
 ## Local test script

@@ -2,7 +2,7 @@
 /**
  * Plugin Name: ACF Schema API
  * Description: REST endpoints to pull and push ACF schema JSON plus plugin-managed bootstrap and content APIs for local automation.
- * Version: 1.5.5
+ * Version: 1.5.6
  * Author: RG Ops
  */
 
@@ -22,6 +22,7 @@ if (!class_exists('RG_ACF_Schema_API')) {
         const OPTION_AUTOMATION_CLAIM_EXPIRES_AT = 'acf_automation_claim_expires_at';
         const OPTION_AUTOMATION_ALLOWED_RESOURCE_TYPES = 'acf_automation_allowed_resource_types';
         const OPTION_AUTOMATION_ENABLED = 'acf_automation_enabled';
+        const OPTION_AUTOMATION_AUTO_EXPORT_DB_ONLY = 'acf_automation_auto_export_db_only';
         const TRANSIENT_AUTOMATION_SECRET_PREVIEW = 'acf_automation_secret_preview';
         const CLAIM_TOKEN_TTL = DAY_IN_SECONDS;
         const SECRET_PREVIEW_TTL = 900;
@@ -273,6 +274,7 @@ if (!class_exists('RG_ACF_Schema_API')) {
             $notice_type = 'updated';
             $claim_token = '';
             $env_block = '';
+            $json_dir = self::get_json_dir();
 
             if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 check_admin_referer('acf_automation_admin_action', 'acf_automation_nonce');
@@ -300,6 +302,28 @@ if (!class_exists('RG_ACF_Schema_API')) {
                     $automation_secret = self::issue_automation_secret();
                     $env_block = self::build_env_block($automation_secret);
                     $notice = 'Automation has been enabled. Copy the .env block now; the secret is only shown once.';
+                } elseif ($action === 'enable_auto_export_db_only') {
+                    update_option(self::OPTION_AUTOMATION_AUTO_EXPORT_DB_ONLY, true, false);
+                    $notice = 'Automatic DB-only group export is now enabled for pull/push.';
+                } elseif ($action === 'disable_auto_export_db_only') {
+                    update_option(self::OPTION_AUTOMATION_AUTO_EXPORT_DB_ONLY, false, false);
+                    $notice = 'Automatic DB-only group export has been disabled.';
+                    $notice_type = 'notice-info';
+                } elseif ($action === 'export_db_only_groups') {
+                    $export_report = self::export_db_only_groups_to_json($json_dir);
+                    if (is_wp_error($export_report)) {
+                        $notice = $export_report->get_error_message();
+                        $notice_type = 'notice-error';
+                    } elseif (!empty($export_report['exported'])) {
+                        $notice = sprintf(
+                            'Exported %d DB-only field group%s to JSON.',
+                            (int) $export_report['exported'],
+                            ((int) $export_report['exported'] === 1) ? '' : 's'
+                        );
+                    } else {
+                        $notice = 'No DB-only field groups needed export.';
+                        $notice_type = 'notice-info';
+                    }
                 }
             }
 
@@ -316,6 +340,7 @@ if (!class_exists('RG_ACF_Schema_API')) {
             }
 
             $status = self::build_bootstrap_status_payload(true, $claim_token);
+            $strict_json_status = self::build_strict_json_status($json_dir);
             $claim_command = '';
             if (!empty($status['claim_token'])) {
                 $claim_command = sprintf(
@@ -342,6 +367,60 @@ if (!class_exists('RG_ACF_Schema_API')) {
                     <h2>Repo <code>.env</code></h2>
                     <p>Automation is already configured. The current secret cannot be shown again because only a hash is stored. Use <strong>Rotate Secret and Show New .env Block</strong> to generate a fresh real secret.</p>
                     <textarea readonly rows="10" style="width: 100%; max-width: 960px; font-family: monospace;" onclick="this.focus();this.select();"><?php echo esc_textarea($env_placeholder_block); ?></textarea>
+                <?php endif; ?>
+
+                <h2>Schema JSON Status</h2>
+                <?php if (is_wp_error($strict_json_status)) : ?>
+                    <div class="notice notice-error inline"><p><?php echo esc_html($strict_json_status->get_error_message()); ?></p></div>
+                <?php else : ?>
+                    <table class="widefat striped" style="max-width: 960px;">
+                        <tbody>
+                            <tr><th>Strict JSON Only</th><td><?php echo esc_html($strict_json_status['strict_json_only'] ? 'Yes' : 'No'); ?></td></tr>
+                            <tr><th>JSON Directory</th><td><code><?php echo esc_html($strict_json_status['json_dir']); ?></code></td></tr>
+                            <tr><th>JSON Groups</th><td><?php echo esc_html((string) $strict_json_status['source_counts']['json']); ?></td></tr>
+                            <tr><th>DB-only Groups</th><td><?php echo esc_html((string) $strict_json_status['source_counts']['db_only']); ?></td></tr>
+                            <tr><th>Auto-export on Pull/Push</th><td><?php echo esc_html($strict_json_status['auto_export_enabled'] ? 'Enabled' : 'Disabled'); ?></td></tr>
+                        </tbody>
+                    </table>
+                    <form method="post" style="margin-top: 8px;">
+                        <?php wp_nonce_field('acf_automation_admin_action', 'acf_automation_nonce'); ?>
+                        <input type="hidden" name="acf_automation_action" value="<?php echo esc_attr($strict_json_status['auto_export_enabled'] ? 'disable_auto_export_db_only' : 'enable_auto_export_db_only'); ?>" />
+                        <?php submit_button($strict_json_status['auto_export_enabled'] ? 'Disable Auto-Export During Pull/Push' : 'Enable Auto-Export During Pull/Push', 'secondary', 'submit', false); ?>
+                    </form>
+
+                    <?php if (!empty($strict_json_status['source_counts']['db_only'])) : ?>
+                        <p style="max-width: 960px;">
+                            <?php if ($strict_json_status['strict_json_only']) : ?>
+                                Strict JSON pull/push is blocked until these DB-only field groups are exported to JSON on the server.
+                            <?php else : ?>
+                                These field groups currently exist only in the database. Exporting them keeps JSON in sync with ACF.
+                            <?php endif; ?>
+                        </p>
+                        <textarea readonly rows="8" style="width: 100%; max-width: 960px; font-family: monospace;" onclick="this.focus();this.select();"><?php echo esc_textarea(implode("\n", $strict_json_status['db_only_group_keys'])); ?></textarea>
+                        <form method="post" style="margin-top: 8px;">
+                            <?php wp_nonce_field('acf_automation_admin_action', 'acf_automation_nonce'); ?>
+                            <input type="hidden" name="acf_automation_action" value="export_db_only_groups" />
+                            <?php submit_button('Export DB-Only Groups to JSON', 'secondary', 'submit', false); ?>
+                        </form>
+                        <?php if (!$strict_json_status['auto_export_enabled']) : ?>
+                            <p style="max-width: 960px;">
+                                Automatic export can be enabled above. Developers can also override it with the <code>acf_schema_api_auto_export_db_only_groups</code> filter.
+                            </p>
+                        <?php endif; ?>
+                    <?php else : ?>
+                        <p style="max-width: 960px;">No DB-only field groups are currently blocking strict JSON pull/push.</p>
+                    <?php endif; ?>
+
+                    <?php if (!empty($strict_json_status['warnings'])) : ?>
+                        <details style="max-width: 960px; margin: 12px 0;">
+                            <summary>Schema scan warnings</summary>
+                            <ul>
+                                <?php foreach ($strict_json_status['warnings'] as $warning) : ?>
+                                    <li><?php echo esc_html($warning); ?></li>
+                                <?php endforeach; ?>
+                            </ul>
+                        </details>
+                    <?php endif; ?>
                 <?php endif; ?>
 
                 <table class="widefat striped" style="max-width: 960px;">
@@ -689,6 +768,10 @@ if (!class_exists('RG_ACF_Schema_API')) {
 
             if (!is_array(get_option(self::OPTION_AUTOMATION_ALLOWED_RESOURCE_TYPES, null))) {
                 update_option(self::OPTION_AUTOMATION_ALLOWED_RESOURCE_TYPES, self::default_allowed_resource_types(), false);
+            }
+
+            if (get_option(self::OPTION_AUTOMATION_AUTO_EXPORT_DB_ONLY, null) === null) {
+                update_option(self::OPTION_AUTOMATION_AUTO_EXPORT_DB_ONLY, false, false);
             }
         }
 
@@ -1134,52 +1217,18 @@ if (!class_exists('RG_ACF_Schema_API')) {
                 return rest_ensure_response($result);
             }
 
-            if (!is_dir($json_dir)) {
-                return new WP_Error(
-                    'acf_schema_api_missing_dir',
-                    'ACF JSON directory does not exist.',
-                    array('status' => 500)
-                );
+            $json_dir_ready = self::ensure_json_dir_ready($json_dir, false);
+            if (is_wp_error($json_dir_ready)) {
+                return $json_dir_ready;
             }
 
-            if (!is_writable($json_dir)) {
-                return new WP_Error(
-                    'acf_schema_api_not_writable',
-                    'ACF JSON directory is not writable.',
-                    array('status' => 500)
-                );
-            }
-
-            $write_errors = array();
+            $groups_to_write = array();
             foreach (array_merge($plan['create'], $plan['update']) as $group_key) {
-                $group = $incoming_map[$group_key];
-                $filename = sanitize_file_name($group_key . '.json');
-                $target_file = trailingslashit($json_dir) . $filename;
-
-                $encoded = wp_json_encode($group, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-                if (!is_string($encoded)) {
-                    $write_errors[] = sprintf('Failed to encode JSON for %s.', $group_key);
-                    continue;
-                }
-
-                $tmp_file = sprintf(
-                    '%s.tmp-%s',
-                    $target_file,
-                    function_exists('wp_generate_uuid4') ? wp_generate_uuid4() : uniqid('', true)
-                );
-
-                $written = @file_put_contents($tmp_file, $encoded . PHP_EOL, LOCK_EX); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
-                if ($written === false) {
-                    $write_errors[] = sprintf('Failed writing temporary file for %s.', $group_key);
-                    continue;
-                }
-
-                if (!@rename($tmp_file, $target_file)) { // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
-                    @unlink($tmp_file); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
-                    $write_errors[] = sprintf('Failed replacing target file for %s.', $group_key);
-                    continue;
-                }
+                $groups_to_write[$group_key] = $incoming_map[$group_key];
             }
+
+            $write_report = self::write_group_json_files($json_dir, $groups_to_write);
+            $write_errors = $write_report['errors'];
 
             $delete_report = array(
                 'requested' => $delete_missing_groups,
@@ -1285,6 +1334,211 @@ if (!class_exists('RG_ACF_Schema_API')) {
             return rest_ensure_response($result);
         }
 
+        private static function ensure_json_dir_ready($json_dir, $create_if_missing)
+        {
+            if (!is_dir($json_dir)) {
+                if (!$create_if_missing) {
+                    return new WP_Error(
+                        'acf_schema_api_missing_dir',
+                        'ACF JSON directory does not exist.',
+                        array('status' => 500)
+                    );
+                }
+
+                if (!wp_mkdir_p($json_dir)) {
+                    return new WP_Error(
+                        'acf_schema_api_mkdir_failed',
+                        'ACF JSON directory could not be created.',
+                        array(
+                            'status' => 500,
+                            'json_dir' => $json_dir,
+                        )
+                    );
+                }
+            }
+
+            if (!is_writable($json_dir)) {
+                return new WP_Error(
+                    'acf_schema_api_not_writable',
+                    'ACF JSON directory is not writable.',
+                    array(
+                        'status' => 500,
+                        'json_dir' => $json_dir,
+                    )
+                );
+            }
+
+            return true;
+        }
+
+        private static function write_group_json_files($json_dir, $group_map)
+        {
+            $report = array(
+                'attempted' => 0,
+                'written' => 0,
+                'keys' => array(),
+                'errors' => array(),
+            );
+
+            if (!is_array($group_map) || empty($group_map)) {
+                return $report;
+            }
+
+            ksort($group_map);
+            foreach ($group_map as $group_key => $group) {
+                $report['attempted']++;
+
+                if (!self::is_valid_group_key($group_key)) {
+                    $report['errors'][] = sprintf('Invalid group key for JSON export: %s.', (string) $group_key);
+                    continue;
+                }
+
+                $filename = sanitize_file_name($group_key . '.json');
+                $target_file = trailingslashit($json_dir) . $filename;
+                $encoded = wp_json_encode($group, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+
+                if (!is_string($encoded)) {
+                    $report['errors'][] = sprintf('Failed to encode JSON for %s.', $group_key);
+                    continue;
+                }
+
+                $tmp_file = sprintf(
+                    '%s.tmp-%s',
+                    $target_file,
+                    function_exists('wp_generate_uuid4') ? wp_generate_uuid4() : uniqid('', true)
+                );
+
+                $written = @file_put_contents($tmp_file, $encoded . PHP_EOL, LOCK_EX); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+                if ($written === false) {
+                    $report['errors'][] = sprintf('Failed writing temporary file for %s.', $group_key);
+                    continue;
+                }
+
+                if (!@rename($tmp_file, $target_file)) { // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+                    @unlink($tmp_file); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+                    $report['errors'][] = sprintf('Failed replacing target file for %s.', $group_key);
+                    continue;
+                }
+
+                $report['written']++;
+                $report['keys'][] = $group_key;
+            }
+
+            return $report;
+        }
+
+        private static function build_strict_json_status($json_dir = '')
+        {
+            if (is_wp_error($json_dir)) {
+                return $json_dir;
+            }
+
+            if ($json_dir === '') {
+                $json_dir = self::get_json_dir();
+                if (is_wp_error($json_dir)) {
+                    return $json_dir;
+                }
+            }
+
+            $json_state = self::load_groups_from_load_json_paths($json_dir);
+            if (is_wp_error($json_state)) {
+                return $json_state;
+            }
+
+            $db_state = self::load_db_only_groups(array_keys($json_state['groups']));
+            if (is_wp_error($db_state)) {
+                return $db_state;
+            }
+
+            $db_only_keys = array_keys($db_state['groups']);
+            sort($db_only_keys);
+
+            return array(
+                'strict_json_only' => self::is_strict_json_only(),
+                'auto_export_enabled' => self::should_auto_export_db_only_groups(),
+                'json_dir' => $json_dir,
+                'db_only_group_keys' => $db_only_keys,
+                'source_counts' => array(
+                    'json' => count($json_state['groups']),
+                    'db_only' => count($db_state['groups']),
+                    'total' => count($json_state['groups']) + count($db_state['groups']),
+                ),
+                'warnings' => array_merge($json_state['warnings'], $db_state['warnings']),
+            );
+        }
+
+        private static function export_db_only_groups_to_json($json_dir = '', $json_state = null, $db_state = null)
+        {
+            if (is_wp_error($json_dir)) {
+                return $json_dir;
+            }
+
+            if ($json_dir === '') {
+                $json_dir = self::get_json_dir();
+                if (is_wp_error($json_dir)) {
+                    return $json_dir;
+                }
+            }
+
+            if (!is_array($json_state)) {
+                $json_state = self::load_groups_from_load_json_paths($json_dir);
+                if (is_wp_error($json_state)) {
+                    return $json_state;
+                }
+            }
+
+            if (!is_array($db_state)) {
+                $db_state = self::load_db_only_groups(array_keys($json_state['groups']));
+                if (is_wp_error($db_state)) {
+                    return $db_state;
+                }
+            }
+
+            $report = array(
+                'json_dir' => $json_dir,
+                'attempted' => count($db_state['groups']),
+                'exported' => 0,
+                'keys' => array(),
+                'warnings' => array_merge($json_state['warnings'], $db_state['warnings']),
+                'errors' => array(),
+            );
+
+            if (empty($db_state['groups'])) {
+                return $report;
+            }
+
+            $json_dir_ready = self::ensure_json_dir_ready($json_dir, true);
+            if (is_wp_error($json_dir_ready)) {
+                return $json_dir_ready;
+            }
+
+            $write_report = self::write_group_json_files($json_dir, $db_state['groups']);
+            $report['exported'] = $write_report['written'];
+            $report['keys'] = $write_report['keys'];
+            $report['errors'] = $write_report['errors'];
+
+            if (!empty($report['errors'])) {
+                return new WP_Error(
+                    'acf_schema_api_db_export_failed',
+                    'One or more DB-only field groups failed to export to JSON.',
+                    array(
+                        'status' => 500,
+                        'report' => $report,
+                        'errors' => $report['errors'],
+                    )
+                );
+            }
+
+            $refreshed_status = self::build_strict_json_status($json_dir);
+            if (!is_wp_error($refreshed_status)) {
+                $report['source_counts_after'] = $refreshed_status['source_counts'];
+                $report['db_only_group_keys_after'] = $refreshed_status['db_only_group_keys'];
+                $report['warnings_after'] = $refreshed_status['warnings'];
+            }
+
+            return $report;
+        }
+
         private static function get_json_dir()
         {
             $default_dir = WP_CONTENT_DIR . '/acf-json';
@@ -1353,6 +1607,25 @@ if (!class_exists('RG_ACF_Schema_API')) {
                 return $db_state;
             }
 
+            $auto_export_attempted = false;
+            if (self::is_strict_json_only() && !empty($db_state['groups']) && self::should_auto_export_db_only_groups()) {
+                $auto_export_attempted = true;
+                $export_report = self::export_db_only_groups_to_json($json_dir, $json_state, $db_state);
+                if (is_wp_error($export_report)) {
+                    return $export_report;
+                }
+
+                $json_state = self::load_groups_from_load_json_paths($json_dir);
+                if (is_wp_error($json_state)) {
+                    return $json_state;
+                }
+
+                $db_state = self::load_db_only_groups(array_keys($json_state['groups']));
+                if (is_wp_error($db_state)) {
+                    return $db_state;
+                }
+            }
+
             if (self::is_strict_json_only() && !empty($db_state['groups'])) {
                 $db_only_keys = array_keys($db_state['groups']);
                 sort($db_only_keys);
@@ -1361,6 +1634,9 @@ if (!class_exists('RG_ACF_Schema_API')) {
                     'Strict JSON mode is enabled and DB-only field groups were detected. Export these groups to JSON before pull/push.',
                     array(
                         'status' => 409,
+                        'json_dir' => $json_dir,
+                        'auto_export_enabled' => self::should_auto_export_db_only_groups(),
+                        'auto_export_attempted' => $auto_export_attempted,
                         'db_only_count' => count($db_only_keys),
                         'db_only_group_keys' => $db_only_keys,
                     )
@@ -1536,6 +1812,16 @@ if (!class_exists('RG_ACF_Schema_API')) {
         private static function is_strict_json_only()
         {
             return (bool) apply_filters('acf_schema_api_strict_json_only', true);
+        }
+
+        private static function should_auto_export_db_only_groups()
+        {
+            return (bool) apply_filters('acf_schema_api_auto_export_db_only_groups', self::is_auto_export_db_only_enabled());
+        }
+
+        private static function is_auto_export_db_only_enabled()
+        {
+            return (bool) get_option(self::OPTION_AUTOMATION_AUTO_EXPORT_DB_ONLY, false);
         }
 
         private static function should_require_signed_push()
