@@ -2,7 +2,7 @@
 /**
  * Plugin Name: ACF Schema API
  * Description: REST endpoints to pull and push ACF schema JSON plus plugin-managed bootstrap and content APIs for local automation.
- * Version: 1.5.6
+ * Version: 1.5.8
  * Author: RG Ops
  */
 
@@ -24,6 +24,7 @@ if (!class_exists('RG_ACF_Schema_API')) {
         const OPTION_AUTOMATION_ENABLED = 'acf_automation_enabled';
         const OPTION_AUTOMATION_AUTO_EXPORT_DB_ONLY = 'acf_automation_auto_export_db_only';
         const TRANSIENT_AUTOMATION_SECRET_PREVIEW = 'acf_automation_secret_preview';
+        const TRANSIENT_APP_PASSWORD_ENV_PREVIEW = 'acf_automation_app_password_env_preview';
         const CLAIM_TOKEN_TTL = DAY_IN_SECONDS;
         const SECRET_PREVIEW_TTL = 900;
         const ADMIN_PAGE_SLUG = 'acf-codex-automation';
@@ -274,6 +275,7 @@ if (!class_exists('RG_ACF_Schema_API')) {
             $notice_type = 'updated';
             $claim_token = '';
             $env_block = '';
+            $app_password_env_block = '';
             $json_dir = self::get_json_dir();
 
             if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -284,6 +286,15 @@ if (!class_exists('RG_ACF_Schema_API')) {
                     $automation_secret = self::issue_automation_secret();
                     $env_block = self::build_env_block($automation_secret);
                     $notice = 'Generated a new automation secret. Copy the .env block now; the secret is only shown once.';
+                } elseif ($action === 'generate_wp_api_env_block') {
+                    $app_password_result = self::issue_application_password_env_block_for_user(get_current_user_id());
+                    if (is_wp_error($app_password_result)) {
+                        $notice = $app_password_result->get_error_message();
+                        $notice_type = 'notice-error';
+                    } else {
+                        $app_password_env_block = $app_password_result['env_block'];
+                        $notice = 'Generated a new WordPress Application Password .env block for the current admin user. Copy it now; the password is only shown once.';
+                    }
                 } elseif ($action === 'generate_claim_token') {
                     $claim_token = self::maybe_issue_claim_token(true);
                     $notice = 'Generated a new one-time claim token.';
@@ -334,6 +345,10 @@ if (!class_exists('RG_ACF_Schema_API')) {
                 }
             }
 
+            if ($app_password_env_block === '') {
+                $app_password_env_block = self::get_application_password_env_preview();
+            }
+
             if ($env_block === '' && !self::is_automation_claimed() && self::is_automation_enabled()) {
                 $automation_secret = self::issue_automation_secret();
                 $env_block = self::build_env_block($automation_secret);
@@ -367,6 +382,17 @@ if (!class_exists('RG_ACF_Schema_API')) {
                     <h2>Repo <code>.env</code></h2>
                     <p>Automation is already configured. The current secret cannot be shown again because only a hash is stored. Use <strong>Rotate Secret and Show New .env Block</strong> to generate a fresh real secret.</p>
                     <textarea readonly rows="10" style="width: 100%; max-width: 960px; font-family: monospace;" onclick="this.focus();this.select();"><?php echo esc_textarea($env_placeholder_block); ?></textarea>
+                <?php endif; ?>
+
+                <h2>WP REST App Password</h2>
+                <p>Generate a standard WordPress REST API Application Password block for the current admin user. This is useful when you want the local scripts to force legacy REST auth instead of plugin-secret auth.</p>
+                <form method="post" style="margin-top: 8px;">
+                    <?php wp_nonce_field('acf_automation_admin_action', 'acf_automation_nonce'); ?>
+                    <input type="hidden" name="acf_automation_action" value="generate_wp_api_env_block" />
+                    <?php submit_button('Generate WP REST App Password .env Block', 'secondary', 'submit', false); ?>
+                </form>
+                <?php if ($app_password_env_block !== '') : ?>
+                    <textarea readonly rows="8" style="width: 100%; max-width: 960px; font-family: monospace; margin-top: 8px;" onclick="this.focus();this.select();"><?php echo esc_textarea($app_password_env_block); ?></textarea>
                 <?php endif; ?>
 
                 <h2>Schema JSON Status</h2>
@@ -783,21 +809,15 @@ if (!class_exists('RG_ACF_Schema_API')) {
 
         private static function default_allowed_resource_types()
         {
-            $types = array('pages', 'posts');
-            $filtered = apply_filters('acf_automation_allowed_resource_types', $types);
-            if (!is_array($filtered) || empty($filtered)) {
-                return $types;
+            $types = array_keys(self::get_rest_resource_type_map());
+            if (empty($types)) {
+                $types = array('pages', 'posts');
             }
 
-            $normalized = array();
-            foreach ($filtered as $type) {
-                $type = sanitize_key((string) $type);
-                if ($type !== '') {
-                    $normalized[] = $type;
-                }
-            }
-
-            return array_values(array_unique($normalized));
+            return self::normalize_allowed_resource_types(
+                apply_filters('acf_automation_allowed_resource_types', $types),
+                $types
+            );
         }
 
         private static function is_automation_enabled()
@@ -838,6 +858,109 @@ if (!class_exists('RG_ACF_Schema_API')) {
         {
             delete_option(self::OPTION_AUTOMATION_SECRET_HASH);
             delete_transient(self::TRANSIENT_AUTOMATION_SECRET_PREVIEW);
+        }
+
+        public static function issue_application_password_env_block_for_user($user_id)
+        {
+            if (!class_exists('WP_Application_Passwords')) {
+                return new WP_Error(
+                    'acf_automation_app_password_unavailable',
+                    'WordPress Application Passwords are not available on this site.',
+                    array('status' => 500)
+                );
+            }
+
+            $user_id = (int) $user_id;
+            if ($user_id <= 0) {
+                return new WP_Error(
+                    'acf_automation_app_password_bad_user',
+                    'A valid user is required to generate an Application Password.',
+                    array('status' => 400)
+                );
+            }
+
+            $user = get_userdata($user_id);
+            if (!$user instanceof WP_User || $user->user_login === '') {
+                return new WP_Error(
+                    'acf_automation_app_password_user_missing',
+                    'The selected user could not be loaded.',
+                    array('status' => 404)
+                );
+            }
+
+            $app_name = self::build_application_password_name();
+            self::delete_application_passwords_by_name($user_id, $app_name);
+
+            $created = WP_Application_Passwords::create_new_application_password(
+                $user_id,
+                array(
+                    'name' => $app_name,
+                )
+            );
+
+            if (is_wp_error($created)) {
+                return $created;
+            }
+
+            if (!is_array($created) || !isset($created[0]) || !is_string($created[0]) || trim($created[0]) === '') {
+                return new WP_Error(
+                    'acf_automation_app_password_create_failed',
+                    'WordPress did not return a usable Application Password.',
+                    array('status' => 500)
+                );
+            }
+
+            $env_block = self::build_application_password_env_block($user->user_login, trim($created[0]));
+            set_transient(self::TRANSIENT_APP_PASSWORD_ENV_PREVIEW, $env_block, self::SECRET_PREVIEW_TTL);
+
+            return array(
+                'env_block' => $env_block,
+                'user_login' => $user->user_login,
+                'name' => $app_name,
+            );
+        }
+
+        private static function get_application_password_env_preview()
+        {
+            $preview = get_transient(self::TRANSIENT_APP_PASSWORD_ENV_PREVIEW);
+            return is_string($preview) ? trim($preview) : '';
+        }
+
+        private static function build_application_password_name()
+        {
+            self::ensure_automation_defaults();
+            $site_id = (string) get_option(self::OPTION_AUTOMATION_SITE_ID, '');
+            if ($site_id !== '') {
+                return 'ACF Automation API (' . $site_id . ')';
+            }
+
+            return 'ACF Automation API';
+        }
+
+        private static function delete_application_passwords_by_name($user_id, $app_name)
+        {
+            if (!class_exists('WP_Application_Passwords')) {
+                return;
+            }
+
+            $passwords = WP_Application_Passwords::get_user_application_passwords($user_id);
+            if (!is_array($passwords)) {
+                return;
+            }
+
+            foreach ($passwords as $password) {
+                if (!is_array($password)) {
+                    continue;
+                }
+
+                $candidate_name = isset($password['name']) ? (string) $password['name'] : '';
+                $candidate_uuid = isset($password['uuid']) ? (string) $password['uuid'] : '';
+                if ($candidate_name !== $app_name || $candidate_uuid === '') {
+                    continue;
+                }
+
+                WP_Application_Passwords::delete_application_password($user_id, $candidate_uuid);
+            }
         }
 
         private static function maybe_issue_claim_token($force)
@@ -942,19 +1065,45 @@ if (!class_exists('RG_ACF_Schema_API')) {
             );
         }
 
+        private static function build_application_password_env_block($username, $app_password)
+        {
+            $status = self::build_bootstrap_status_payload(false, '');
+            $base_url = untrailingslashit((string) $status['target_base_url']);
+
+            return implode(
+                "\n",
+                array(
+                    'TARGET_BASE_URL=' . $base_url,
+                    'ACF_AUTH_MODE=legacy',
+                    'WP_API_USER=' . $username,
+                    'WP_API_APP_PASSWORD=' . $app_password,
+                    'ALLOWED_RESOURCE_TYPES=' . implode(',', $status['allowed_resource_types']),
+                )
+            );
+        }
+
         private static function resolve_allowed_resource_types()
         {
-            $types = get_option(self::OPTION_AUTOMATION_ALLOWED_RESOURCE_TYPES, self::default_allowed_resource_types());
-            if (!is_array($types) || empty($types)) {
-                $types = self::default_allowed_resource_types();
+            $stored_types = get_option(self::OPTION_AUTOMATION_ALLOWED_RESOURCE_TYPES, array());
+            if (!is_array($stored_types)) {
+                $stored_types = array();
             }
 
-            return array_values(array_unique(array_map('sanitize_key', $types)));
+            $discovered_types = array_keys(self::get_rest_resource_type_map());
+            $merged_types = array_merge($discovered_types, $stored_types);
+            if (empty($merged_types)) {
+                $merged_types = array('pages', 'posts');
+            }
+
+            return self::normalize_allowed_resource_types(
+                apply_filters('acf_automation_allowed_resource_types', $merged_types),
+                $merged_types
+            );
         }
 
         private static function resolve_post_type_for_resource($resource_type)
         {
-            $resource_type = sanitize_key((string) $resource_type);
+            $resource_type = self::normalize_resource_type_token($resource_type);
             if ($resource_type === '') {
                 return '';
             }
@@ -963,12 +1112,9 @@ if (!class_exists('RG_ACF_Schema_API')) {
                 return '';
             }
 
-            $post_types = get_post_types(array('show_in_rest' => true), 'objects');
-            foreach ($post_types as $post_type => $object) {
-                $rest_base = !empty($object->rest_base) ? sanitize_key((string) $object->rest_base) : sanitize_key((string) $post_type);
-                if ($rest_base === $resource_type || sanitize_key((string) $post_type) === $resource_type) {
-                    return (string) $post_type;
-                }
+            $resource_map = self::get_rest_resource_type_map();
+            if (isset($resource_map[$resource_type])) {
+                return $resource_map[$resource_type];
             }
 
             return '';
@@ -988,8 +1134,11 @@ if (!class_exists('RG_ACF_Schema_API')) {
             if ($post_type === '') {
                 return new WP_Error(
                     'acf_automation_bad_resource_type',
-                    sprintf('resource_type %s is not allowlisted.', esc_html((string) $resource_type)),
-                    array('status' => 400)
+                    sprintf('resource_type %s is unsupported for this site.', esc_html((string) $resource_type)),
+                    array(
+                        'status' => 400,
+                        'allowed_resource_types' => self::resolve_allowed_resource_types(),
+                    )
                 );
             }
 
@@ -1851,6 +2000,66 @@ if (!class_exists('RG_ACF_Schema_API')) {
 
             $secret = (string) apply_filters('acf_schema_api_hmac_secret', $secret);
             return trim($secret);
+        }
+
+        private static function get_rest_resource_type_map()
+        {
+            $map = array();
+            $post_types = get_post_types(array('show_in_rest' => true), 'objects');
+
+            foreach ($post_types as $post_type => $object) {
+                $post_type_token = self::normalize_resource_type_token($post_type);
+                if ($post_type_token !== '') {
+                    $map[$post_type_token] = (string) $post_type;
+                }
+
+                $rest_base = '';
+                if (is_object($object) && !empty($object->rest_base)) {
+                    $rest_base = self::normalize_resource_type_token((string) $object->rest_base);
+                }
+
+                if ($rest_base !== '') {
+                    $map[$rest_base] = (string) $post_type;
+                }
+            }
+
+            ksort($map);
+            return $map;
+        }
+
+        private static function normalize_allowed_resource_types($types, $fallback)
+        {
+            if (!is_array($types) || empty($types)) {
+                $types = $fallback;
+            }
+
+            $normalized = array();
+            foreach ($types as $type) {
+                $type = self::normalize_resource_type_token($type);
+                if ($type !== '') {
+                    $normalized[] = $type;
+                }
+            }
+
+            if (empty($normalized)) {
+                return array_values(array_unique($fallback));
+            }
+
+            return array_values(array_unique($normalized));
+        }
+
+        private static function normalize_resource_type_token($type)
+        {
+            if (!is_string($type) && !is_numeric($type)) {
+                return '';
+            }
+
+            $type = trim((string) $type);
+            if ($type === '' || !preg_match('/^[A-Za-z0-9_-]+$/', $type)) {
+                return '';
+            }
+
+            return sanitize_key($type);
         }
 
         private static function verify_signed_push_request(WP_REST_Request $request)
